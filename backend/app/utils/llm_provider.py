@@ -13,6 +13,7 @@ class LLMProvider(Enum):
     OLLAMA = "ollama"
     OPENROUTER = "openrouter"
     OPENAI = "openai"
+    NVIDIA = "nvidia"
     CUSTOM = "custom"
 
 
@@ -59,6 +60,8 @@ class ProviderConfig:
                 provider = LLMProvider.OPENROUTER
             elif 'api.openai.com' in base_url:
                 provider = LLMProvider.OPENAI
+            elif 'integrate.api.nvidia.com' in base_url or 'nvidia.com' in base_url:
+                provider = LLMProvider.NVIDIA
             else:
                 provider = LLMProvider.CUSTOM
         else:
@@ -79,6 +82,62 @@ class ProviderConfig:
             # OpenRouter supports extra parameters like reasoning_effort
             extra_config['reasoning_effort'] = os.environ.get('OPENROUTER_REASONING_EFFORT', 'medium')
         
+        elif provider == LLMProvider.NVIDIA:
+            # NVIDIA NIM-specific: model presets with optimized parameters
+            nvidia_model = model.lower()
+            
+            # Reasoning/Thinking models configuration
+            reasoning_models = {
+                'nvidia/nemotron-3-super-120b-a12b': {'reasoning_budget': 16384, 'enable_thinking': True},
+                'qwen/qwen3.5-122b-a10b': {'enable_thinking': True},
+                'qwen/qwen3.5-397b-a17b': {'enable_thinking': True},
+                'z-ai/glm5': {'enable_thinking': True, 'clear_thinking': False},
+                'z-ai/glm4.7': {'enable_thinking': True, 'clear_thinking': False},
+                'moonshotai/kimi-k2.5': {'thinking': True},
+            }
+            
+            # Check if current model supports reasoning/thinking
+            for model_pattern, thinking_config in reasoning_models.items():
+                if model_pattern in nvidia_model or any(x in nvidia_model for x in model_pattern.split('/')):
+                    extra_config['chat_template_kwargs'] = thinking_config
+                    if 'reasoning_budget' in thinking_config:
+                        extra_config['reasoning_budget'] = thinking_config['reasoning_budget']
+                    break
+            
+            # Model-specific temperature and token defaults
+            if 'mistral-small' in nvidia_model:
+                extra_config.setdefault('temperature', 0.10)
+                extra_config.setdefault('top_p', 1.00)
+                extra_config.setdefault('max_tokens', 16384)
+                extra_config['reasoning_effort'] = 'high'
+            elif 'nemotron' in nvidia_model:
+                extra_config.setdefault('temperature', 1.0)
+                extra_config.setdefault('top_p', 0.95)
+                extra_config.setdefault('max_tokens', 16384)
+            elif 'qwen' in nvidia_model:
+                extra_config.setdefault('temperature', 0.60)
+                extra_config.setdefault('top_p', 0.95)
+                extra_config.setdefault('max_tokens', 16384)
+                extra_config.setdefault('top_k', 20)
+                extra_config.setdefault('presence_penalty', 0)
+                extra_config.setdefault('repetition_penalty', 1)
+            elif 'minimax' in nvidia_model:
+                extra_config.setdefault('temperature', 1.0)
+                extra_config.setdefault('top_p', 0.95)
+                extra_config.setdefault('max_tokens', 8192)
+            elif 'glm' in nvidia_model:
+                extra_config.setdefault('temperature', 1.0)
+                extra_config.setdefault('top_p', 1.0)
+                extra_config.setdefault('max_tokens', 16384)
+            elif 'step' in nvidia_model:
+                extra_config.setdefault('temperature', 1.0)
+                extra_config.setdefault('top_p', 0.9)
+                extra_config.setdefault('max_tokens', 16384)
+            elif 'kimi' in nvidia_model:
+                extra_config.setdefault('temperature', 1.0)
+                extra_config.setdefault('top_p', 1.0)
+                extra_config.setdefault('max_tokens', 16384)
+        
         return cls(
             provider=provider,
             api_key=api_key,
@@ -94,6 +153,10 @@ class ProviderConfig:
     def is_openrouter(self) -> bool:
         """Check if this is an OpenRouter provider"""
         return self.provider == LLMProvider.OPENROUTER
+    
+    def is_nvidia(self) -> bool:
+        """Check if this is a NVIDIA provider"""
+        return self.provider == LLMProvider.NVIDIA
     
     def get_request_kwargs(self, **overrides) -> Dict[str, Any]:
         """
@@ -130,6 +193,23 @@ class ProviderConfig:
             # Add reasoning effort if specified
             if self.extra_config.get('reasoning_effort'):
                 kwargs['reasoning_effort'] = self.extra_config['reasoning_effort']
+        
+        elif self.provider == LLMProvider.NVIDIA:
+            # NVIDIA NIM: pass chat_template_kwargs, reasoning_budget, and model-specific params
+            if 'chat_template_kwargs' in self.extra_config:
+                if 'extra_body' not in kwargs:
+                    kwargs['extra_body'] = {}
+                kwargs['extra_body']['chat_template_kwargs'] = self.extra_config['chat_template_kwargs']
+            
+            if 'reasoning_budget' in self.extra_config:
+                if 'extra_body' not in kwargs:
+                    kwargs['extra_body'] = {}
+                kwargs['extra_body']['reasoning_budget'] = self.extra_config['reasoning_budget']
+            
+            # Pass through model-specific defaults if not overridden
+            for key in ['temperature', 'top_p', 'max_tokens', 'top_k', 'presence_penalty', 'repetition_penalty', 'reasoning_effort']:
+                if key in self.extra_config and key not in kwargs:
+                    kwargs[key] = self.extra_config[key]
         
         return kwargs
     
