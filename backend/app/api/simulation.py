@@ -1,13 +1,17 @@
 """
-Simulation-related API routes
+Simulation-related API routes - FastAPI Version
 Step2: Entity reading and filtering, OASIS simulation preparation and execution (fully automated)
+Migrated from Flask to FastAPI with async support
 """
 
 import os
 import traceback
-from flask import request, jsonify, send_file, current_app
+import threading
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Query, Body
+from pydantic import BaseModel
 
-from . import simulation_bp
+from . import simulation_router
 from ..config import Config
 from ..services.entity_reader import EntityReader
 from ..services.oasis_profile_generator import OasisProfileGenerator
@@ -15,6 +19,7 @@ from ..services.simulation_manager import SimulationManager, SimulationStatus
 from ..services.simulation_runner import SimulationRunner, RunnerStatus
 from ..utils.logger import get_logger
 from ..models.project import ProjectManager
+from ..storage import Neo4jStorage
 
 logger = get_logger('mirofish.api.simulation')
 
@@ -42,89 +47,99 @@ def optimize_interview_prompt(prompt: str) -> str:
     return f"{INTERVIEW_PROMPT_PREFIX}{prompt}"
 
 
+def _get_storage():
+    """Get Neo4jStorage singleton"""
+    storage = Neo4jStorage()
+    if not storage:
+        raise ValueError("GraphStorage not initialized")
+    return storage
+
+
+# Pydantic models for request/response validation
+class EntityFilterRequest(BaseModel):
+    entity_types: Optional[List[str]] = None
+    enrich: bool = True
+
+
+class SimulationCreateRequest(BaseModel):
+    project_id: str
+    graph_id: Optional[str] = None
+    enable_twitter: bool = True
+    enable_reddit: bool = True
+
+
+class SimulationPrepareRequest(BaseModel):
+    simulation_id: str
+    entity_types: Optional[List[str]] = None
+    use_llm_for_profiles: bool = True
+    parallel_profile_count: int = 5
+    force_regenerate: bool = False
+
+
 # ============== Entity reading interface ==============
 
-@simulation_bp.route('/entities/<graph_id>', methods=['GET'])
-def get_graph_entities(graph_id: str):
+@simulation_router.get('/entities/{graph_id}', response_model=Dict[str, Any])
+async def get_graph_entities(
+    graph_id: str,
+    entity_types: Optional[str] = Query(None, description="Comma-separated list of entity types"),
+    enrich: bool = Query(True, description="Whether to get related edge information")
+):
     """
     Get all entities from the knowledge graph (filtered)
     
     Only return nodes that match predefined entity types (nodes whose Labels are not just Entity)
-    
-    Query parameters:
-        entity_types: comma-separated list of entity types (optional, for further filtering)
-        enrich: whether to get related edge information (default true)
     """
     try:
-        entity_types_str = request.args.get('entity_types', '')
-        entity_types = [t.strip() for t in entity_types_str.split(',') if t.strip()] if entity_types_str else None
-        enrich = request.args.get('enrich', 'true').lower() == 'true'
+        entity_types_list = [t.strip() for t in entity_types.split(',') if t.strip()] if entity_types else None
         
-        logger.info(f"Get knowledge graph entities: graph_id={graph_id}, entity_types={entity_types}, enrich={enrich}")
+        logger.info(f"Get knowledge graph entities: graph_id={graph_id}, entity_types={entity_types_list}, enrich={enrich}")
         
-        storage = current_app.extensions.get('neo4j_storage')
-        if not storage:
-            raise ValueError("GraphStorage not initialized")
+        storage = _get_storage()
         reader = EntityReader(storage)
         result = reader.filter_defined_entities(
             graph_id=graph_id,
-            defined_entity_types=entity_types,
+            defined_entity_types=entity_types_list,
             enrich_with_edges=enrich
         )
         
-        return jsonify({
+        return {
             "success": True,
             "data": result.to_dict()
-        })
+        }
         
     except Exception as e:
         logger.error(f"Failed to get knowledge graph entities: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@simulation_bp.route('/entities/<graph_id>/<entity_uuid>', methods=['GET'])
-def get_entity_detail(graph_id: str, entity_uuid: str):
+@simulation_router.get('/entities/{graph_id}/{entity_uuid}', response_model=Dict[str, Any])
+async def get_entity_detail(graph_id: str, entity_uuid: str):
     """Get detailed information of a single entity"""
     try:
-        storage = current_app.extensions.get('neo4j_storage')
-        if not storage:
-            raise ValueError("GraphStorage not initialized")
+        storage = _get_storage()
         reader = EntityReader(storage)
         entity = reader.get_entity_with_context(graph_id, entity_uuid)
         
         if not entity:
-            return jsonify({
-                "success": False,
-                "error": f"Entity does not exist: {entity_uuid}"
-            }), 404
+            raise HTTPException(status_code=404, detail=f"Entity does not exist: {entity_uuid}")
         
-        return jsonify({
+        return {
             "success": True,
             "data": entity.to_dict()
-        })
+        }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get entity details: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@simulation_bp.route('/entities/<graph_id>/by-type/<entity_type>', methods=['GET'])
-def get_entities_by_type(graph_id: str, entity_type: str):
+@simulation_router.get('/entities/{graph_id}/by-type/{entity_type}', response_model=Dict[str, Any])
+async def get_entities_by_type(graph_id: str, entity_type: str, enrich: bool = Query(True)):
     """Get all entities of specified type"""
     try:
-        enrich = request.args.get('enrich', 'true').lower() == 'true'
-        
-        storage = current_app.extensions.get('neo4j_storage')
-        if not storage:
-            raise ValueError("GraphStorage not initialized")
+        storage = _get_storage()
         reader = EntityReader(storage)
         entities = reader.get_entities_by_type(
             graph_id=graph_id,
@@ -132,22 +147,18 @@ def get_entities_by_type(graph_id: str, entity_type: str):
             enrich_with_edges=enrich
         )
         
-        return jsonify({
+        return {
             "success": True,
             "data": {
                 "entity_type": entity_type,
                 "count": len(entities),
                 "entities": [e.to_dict() for e in entities]
             }
-        })
+        }
         
     except Exception as e:
         logger.error(f"Failed to get entities: {str(e)}")
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============== Simulation management interface ==============
