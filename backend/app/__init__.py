@@ -1,92 +1,122 @@
 """
-MiroFish Backend - Flask Application Factory
+MiroFish Backend - FastAPI Application Factory
+Migrated from Flask to FastAPI for async support and better performance
 """
 
 import os
 import warnings
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
 # Suppress multiprocessing resource_tracker warnings (from third-party libraries like transformers)
-# Must be set before all other imports
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, request
-from flask_cors import CORS
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import Config
 from .utils.logger import setup_logger, get_logger
 
 
-def create_app(config_class=Config):
-    """Flask application factory function"""
-    app = Flask(__name__)
-    app.config.from_object(config_class)
-
-    # Configure JSON encoding: ensure Chinese displays directly (not as \uXXXX)
-    # Flask >= 2.3 uses app.json.ensure_ascii, older versions use JSON_AS_ASCII config
-    if hasattr(app, 'json') and hasattr(app.json, 'ensure_ascii'):
-        app.json.ensure_ascii = False
-
-    # Setup logging
-    logger = setup_logger('mirofish')
-
-    # Only print startup info in reloader subprocess (avoid printing twice in debug mode)
-    is_reloader_process = os.environ.get('WERKZEUG_RUN_MAIN') == 'true'
-    debug_mode = app.config.get('DEBUG', False)
-    should_log_startup = not debug_mode or is_reloader_process
-
-    if should_log_startup:
-        logger.info("=" * 50)
-        logger.info("MiroFish-Offline Backend starting...")
-        logger.info("=" * 50)
-
-    # Enable CORS
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
-
-    # --- Initialize Neo4jStorage singleton (DI via app.extensions) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator:
+    """FastAPI lifespan manager for startup and shutdown events"""
+    logger = get_logger('mirofish')
+    
+    # Startup
+    logger.info("=" * 50)
+    logger.info("MiroFish-Offline Backend starting...")
+    logger.info("=" * 50)
+    
+    # Initialize Neo4jStorage singleton
     from .storage import Neo4jStorage
     try:
         neo4j_storage = Neo4jStorage()
-        app.extensions['neo4j_storage'] = neo4j_storage
-        if should_log_startup:
-            logger.info("Neo4jStorage initialized (connected to %s)", Config.NEO4J_URI)
+        app.state.neo4j_storage = neo4j_storage
+        logger.info("Neo4jStorage initialized (connected to %s)", Config.NEO4J_URI)
     except Exception as e:
         logger.error("Neo4jStorage initialization failed: %s", e)
-        # Store None so endpoints can return 503 gracefully
-        app.extensions['neo4j_storage'] = None
-
-    # Register simulation process cleanup function (ensure all simulation processes terminate on server shutdown)
+        app.state.neo4j_storage = None
+    
+    # Register simulation process cleanup function
     from .services.simulation_runner import SimulationRunner
     SimulationRunner.register_cleanup()
-    if should_log_startup:
-        logger.info("Simulation process cleanup function registered")
+    logger.info("Simulation process cleanup function registered")
+    
+    logger.info("MiroFish-Offline Backend startup complete")
+    
+    yield
+    
+    # Shutdown
+    logger.info("MiroFish-Offline Backend shutting down...")
+    # Add any cleanup logic here if needed
 
+
+def create_app() -> FastAPI:
+    """FastAPI application factory function"""
+    app = FastAPI(
+        title="MiroFish-Offline API",
+        description="Multi-agent social simulation backend with smart LLM rotation",
+        version="2.0.0",
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        lifespan=lifespan
+    )
+    
+    # Enable CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
     # Request logging middleware
-    @app.before_request
-    def log_request():
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
         logger = get_logger('mirofish.request')
-        logger.debug(f"Request: {request.method} {request.path}")
-        if request.content_type and 'json' in request.content_type:
-            logger.debug(f"Request body: {request.get_json(silent=True)}")
-
-    @app.after_request
-    def log_response(response):
-        logger = get_logger('mirofish.request')
+        logger.debug(f"Request: {request.method} {request.url.path}")
+        
+        if request.method in ["POST", "PUT"] and 'json' in request.headers.get('content-type', ''):
+            try:
+                body = await request.json()
+                logger.debug(f"Request body: {body}")
+            except Exception:
+                pass
+        
+        response = await call_next(request)
         logger.debug(f"Response: {response.status_code}")
         return response
-
-    # Register blueprints
-    from .api import graph_bp, simulation_bp, report_bp
-    app.register_blueprint(graph_bp, url_prefix='/api/graph')
-    app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
-    app.register_blueprint(report_bp, url_prefix='/api/report')
-
+    
+    # Global exception handler
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger = get_logger('mirofish.error')
+        logger.error(f"Unhandled exception: {exc}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "type": type(exc).__name__}
+        )
+    
+    # Include routers
+    from .api import graph_router, simulation_router, report_router
+    app.include_router(graph_router, prefix="/api/graph", tags=["Graph"])
+    app.include_router(simulation_router, prefix="/api/simulation", tags=["Simulation"])
+    app.include_router(report_router, prefix="/api/report", tags=["Report"])
+    
     # Health check
-    @app.route('/health')
-    def health():
-        return {'status': 'ok', 'service': 'MiroFish-Offline Backend'}
-
-    if should_log_startup:
-        logger.info("MiroFish-Offline Backend startup complete")
-
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "service": "MiroFish-Offline Backend"}
+    
+    # LLM Metrics endpoint (for monitoring rotation)
+    @app.get("/api/v1/llm/metrics")
+    async def llm_metrics():
+        from .utils.llm_rotator import SmartLLMRotator
+        rotator = SmartLLMRotator()
+        return rotator.get_metrics()
+    
     return app
-
