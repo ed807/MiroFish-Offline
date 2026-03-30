@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 
-from ..config.llm_providers_config import PROVIDERS, ROTATION_CONFIG, TASK_ROUTING
+from app.llm_providers_config import PROVIDERS, ROTATION_CONFIG, TASK_ROUTING
 from .llm_provider import LLMProvider, ProviderConfig
 from .logger import get_logger
 
